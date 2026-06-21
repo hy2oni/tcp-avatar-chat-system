@@ -25,6 +25,7 @@ static volatile int running = 1;
 static pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char latest_map[UI_MAP_MAX] = "Waiting for map update...";
 static char latest_status[UI_LINE_MAX] = "Not logged in";
+static char latest_notice[UI_LINE_MAX] = "";
 static char log_lines[UI_LOG_LINES][UI_LINE_MAX];
 static int log_count = 0;
 static int collecting_map = 0;
@@ -83,6 +84,9 @@ static void ui_render_locked(void) {
     printf("%s\n", latest_map);
     printf("-------------------------------------------------------------------\n");
     printf(UI_COLOR_SECTION "[ STATUS ] " UI_COLOR_RESET "%s\n", latest_status);
+    if (latest_notice[0] != '\0') {
+        printf(UI_COLOR_WARN "[ NOTICE ] %s\n" UI_COLOR_RESET, latest_notice);
+    }
     printf("Commands: w/a/s/d | /chat msg | /shout msg | /map | /help | /quit\n");
     printf("-------------------------------------------------------------------\n");
     printf(UI_COLOR_SECTION "[ CHAT / SYSTEM / QUIZ LOG ]\n" UI_COLOR_RESET);
@@ -96,6 +100,11 @@ static void ui_render_locked(void) {
 }
 
 static void ui_handle_line_locked(const char *line) {
+    if (strncmp(line, "[Error]", 7) == 0) {
+        snprintf(latest_notice, sizeof(latest_notice), "%s", line);
+        return;
+    }
+
     if (strncmp(line, "==== Room", 9) == 0) {
         collecting_map = 1;
         map_builder[0] = '\0';
@@ -109,6 +118,7 @@ static void ui_handle_line_locked(const char *line) {
         if (strncmp(line, "Commands:", 9) == 0) {
             collecting_map = 0;
             snprintf(latest_map, sizeof(latest_map), "%s", map_builder);
+            latest_notice[0] = '\0';
         }
         return;
     }
