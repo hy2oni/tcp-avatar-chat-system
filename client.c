@@ -148,6 +148,10 @@ static int is_log_worthy(const char *line) {
     if (line == NULL || line[0] == '\0' || strcmp(line, "LOGIN_OK") == 0) {
         return 0;
     }
+    if (strncmp(line, "WELCOME ", 8) == 0 ||
+        strncmp(line, "Send LOGIN|", 11) == 0) {
+        return 0;
+    }
     if (strncmp(line, "[Help]", 6) == 0 ||
         strncmp(line, "w/a/s/d", 7) == 0 ||
         strncmp(line, "/chat", 5) == 0 ||
@@ -340,20 +344,47 @@ static void *recv_thread(void *arg) {
 
 static int wait_for_login_result(int sock) {
     char buf[4096];
+    char initial[UI_MAP_MAX * 2];
+    int got_login_ok = 0;
+
+    initial[0] = '\0';
 
     while (1) {
-        ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
+        ssize_t n;
+
+        if (got_login_ok) {
+            fd_set set;
+            struct timeval tv;
+
+            FD_ZERO(&set);
+            FD_SET(sock, &set);
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+
+            if (select(sock + 1, &set, NULL, NULL, &tv) <= 0) {
+                ui_process_server_text(initial);
+                return 1;
+            }
+        }
+
+        n = recv(sock, buf, sizeof(buf) - 1, 0);
         if (n <= 0) {
             return 0;
         }
         buf[n] = '\0';
-        printf("%s", buf);
-        fflush(stdout);
 
-        if (strstr(buf, "LOGIN_OK") != NULL) {
-            return 1;
+        if (got_login_ok || strstr(buf, "LOGIN_OK") != NULL) {
+            got_login_ok = 1;
+            strncat(initial, buf, sizeof(initial) - strlen(initial) - 1);
+            if (strstr(initial, "Commands:") != NULL) {
+                ui_process_server_text(initial);
+                return 1;
+            }
+            continue;
         }
         if (strstr(buf, "LOGIN_FAIL|") != NULL) {
+            printf("%s", buf);
+            fflush(stdout);
             return -1;
         }
     }
@@ -706,7 +737,6 @@ int main(int argc, char *argv[]) {
 
     pthread_mutex_lock(&ui_mutex);
     ui_add_log_locked("[Client] MOVE: wasd instant, c chat, / command. Fallback terminals use Enter.");
-    ui_render_locked();
     pthread_mutex_unlock(&ui_mutex);
 
     if (enable_raw_terminal()) {

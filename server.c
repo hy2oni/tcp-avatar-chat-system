@@ -285,6 +285,28 @@ static int is_spawnable_locked(int room_id, int x, int y) {
 }
 
 static int find_random_spawn_locked(int room_id, int *out_x, int *out_y) {
+    if (room_id == 1) {
+        int candidates[15][2];
+        int count = 0;
+
+        for (int y = 7; y <= 9; y++) {
+            for (int x = 12; x <= 16; x++) {
+                if (is_spawnable_locked(room_id, x, y)) {
+                    candidates[count][0] = x;
+                    candidates[count][1] = y;
+                    count++;
+                }
+            }
+        }
+
+        if (count > 0) {
+            int pick = rand() % count;
+            *out_x = candidates[pick][0];
+            *out_y = candidates[pick][1];
+            return 1;
+        }
+    }
+
     for (int tries = 0; tries < 500; tries++) {
         int x = rand() % MAP_W;
         int y = rand() % MAP_H;
