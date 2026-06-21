@@ -34,8 +34,12 @@ Duplicate nicknames and duplicate avatars are rejected by the server.
 
 Commands
 --------
-w / a / s / d          Move
+w / a / s / d          Move instantly in a normal Linux terminal
+c                      Enter chat mode
+/                      Enter command mode
 /chat message          Chat. In Room 3, private if seated at a table.
+/chat                  Enter chat mode from command mode
+/move                  Return from chat mode to move mode
 /c message             Alias for /chat
 /shout message         Public Room 3 chat, useful from a table seat.
 /s message             Alias for /shout
@@ -52,6 +56,16 @@ The client uses ANSI escape sequences to redraw a simple dashboard:
 - current player status
 - recent chat/system/quiz log
 - bottom input prompt
+
+In a normal Linux terminal, the client uses raw input mode:
+- MOVE mode: w/a/s/d moves immediately without Enter.
+- Press c to enter CHAT mode.
+- CHAT mode sends each line as chat after Enter.
+- Type /move or press ESC to return to MOVE mode.
+- Press / in MOVE mode to type one command such as /map or /quit.
+
+If the client is run from a pipe or non-interactive terminal, it falls back to
+line input mode where Enter is required.
 
 Maps are pushed by the server after movement, room transitions, joins, and
 disconnects, so users in the same room see avatar position changes without

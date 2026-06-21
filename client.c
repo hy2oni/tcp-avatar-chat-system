@@ -5,10 +5,13 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <termios.h>
 #include <unistd.h>
 
 #define UI_LOG_LINES 14
@@ -20,16 +23,51 @@
 #define UI_COLOR_SECTION "\033[1;34m"
 #define UI_COLOR_WARN "\033[1;31m"
 #define UI_COLOR_OK "\033[1;32m"
+#define UI_COLOR_DIM "\033[2;37m"
+#define UI_COLOR_PORTAL "\033[1;36m"
+#define UI_COLOR_AVATAR1 "\033[1;32m"
+#define UI_COLOR_AVATAR2 "\033[1;35m"
+#define UI_COLOR_AVATAR3 "\033[1;34m"
+#define UI_COLOR_AVATAR4 "\033[1;31m"
+#define UI_COLOR_AVATAR5 "\033[1;33m"
+
+typedef enum {
+    MODE_LINE = 0,
+    MODE_MOVE,
+    MODE_CHAT,
+    MODE_COMMAND
+} InputMode;
 
 static volatile int running = 1;
 static pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
+static InputMode input_mode = MODE_LINE;
+static char current_input[MAX_MSG];
 static char latest_map[UI_MAP_MAX] = "Waiting for map update...";
 static char latest_status[UI_LINE_MAX] = "Not logged in";
 static char latest_notice[UI_LINE_MAX] = "";
+static int latest_notice_ttl = 0;
 static char log_lines[UI_LOG_LINES][UI_LINE_MAX];
 static int log_count = 0;
 static int collecting_map = 0;
 static char map_builder[UI_MAP_MAX];
+static struct termios original_termios;
+static int raw_terminal_enabled = 0;
+
+static void restore_terminal(void) {
+    if (raw_terminal_enabled) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &original_termios);
+        raw_terminal_enabled = 0;
+        printf("\033[?25h");
+        fflush(stdout);
+    }
+}
+
+static void handle_signal(int sig) {
+    (void)sig;
+    running = 0;
+    restore_terminal();
+    _exit(0);
+}
 
 static void trim_newline(char *s) {
     size_t n = strlen(s);
@@ -45,6 +83,19 @@ static void send_line(int sock, const char *line) {
     send(sock, buf, strlen(buf), 0);
 }
 
+static const char *mode_name(InputMode mode) {
+    switch (mode) {
+        case MODE_MOVE:
+            return "MOVE";
+        case MODE_CHAT:
+            return "CHAT";
+        case MODE_COMMAND:
+            return "COMMAND";
+        default:
+            return "LINE";
+    }
+}
+
 static void ui_add_log_locked(const char *line) {
     if (line == NULL || line[0] == '\0' || strcmp(line, "LOGIN_OK") == 0) {
         return;
@@ -53,10 +104,95 @@ static void ui_add_log_locked(const char *line) {
     log_count++;
 }
 
+static void ui_set_notice_locked(const char *line) {
+    snprintf(latest_notice, sizeof(latest_notice), "%s", line);
+    latest_notice_ttl = 1;
+}
+
+static int is_system_notice(const char *line) {
+    if (strncmp(line, "[Error]", 7) == 0 || strncmp(line, "[System]", 8) == 0) {
+        return 1;
+    }
+    if (strstr(line, "entered the Lobby") || strstr(line, "left the Lobby")) {
+        return 1;
+    }
+    if (strstr(line, "joined the table") || strstr(line, "left the table")) {
+        return 1;
+    }
+    if (strstr(line, "You are on the Quiz Start Block") ||
+        strstr(line, "You are the quiz starter") ||
+        strstr(line, "/start is allowed only") ||
+        strstr(line, "Answer saved") ||
+        strstr(line, "not a participant")) {
+        return 1;
+    }
+    return 0;
+}
+
+static int is_log_worthy(const char *line) {
+    if (line == NULL || line[0] == '\0' || strcmp(line, "LOGIN_OK") == 0) {
+        return 0;
+    }
+    if (strncmp(line, "[Help]", 6) == 0 ||
+        strncmp(line, "w/a/s/d", 7) == 0 ||
+        strncmp(line, "/chat", 5) == 0 ||
+        strncmp(line, "/shout", 6) == 0 ||
+        strncmp(line, "/map", 4) == 0 ||
+        strncmp(line, "/start", 6) == 0 ||
+        strncmp(line, "O or X", 6) == 0 ||
+        strncmp(line, "/quit", 5) == 0) {
+        return 0;
+    }
+    return !is_system_notice(line);
+}
+
 static void ui_extract_status_locked(const char *line) {
     if (strncmp(line, "You: ", 5) == 0) {
         snprintf(latest_status, sizeof(latest_status), "%s", line);
     }
+}
+
+static const char *avatar_color(char ch) {
+    switch (toupper((unsigned char)ch) % 5) {
+        case 0:
+            return UI_COLOR_AVATAR1;
+        case 1:
+            return UI_COLOR_AVATAR2;
+        case 2:
+            return UI_COLOR_AVATAR3;
+        case 3:
+            return UI_COLOR_AVATAR4;
+        default:
+            return UI_COLOR_AVATAR5;
+    }
+}
+
+static void print_colored_map_text(const char *text) {
+    int in_grid = 0;
+
+    for (const char *p = text; *p; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch == '\n') {
+            putchar('\n');
+            in_grid = 0;
+        } else if (ch == '#') {
+            in_grid = 1;
+            printf(UI_COLOR_DIM "#");
+        } else if (ch == '@') {
+            printf(UI_COLOR_PORTAL "@");
+        } else if (ch == 'Q') {
+            printf(UI_COLOR_ROOM "Q");
+        } else if (ch == 'T') {
+            printf(UI_COLOR_WARN "T");
+        } else if (in_grid && ch >= '1' && ch <= '4') {
+            printf(UI_COLOR_PORTAL "%c", ch);
+        } else if (in_grid && isalpha(ch)) {
+            printf("%s%c", avatar_color((char)ch), ch);
+        } else {
+            printf(UI_COLOR_RESET "%c", ch);
+        }
+    }
+    printf(UI_COLOR_RESET);
 }
 
 static const char *line_color(const char *line) {
@@ -81,27 +217,36 @@ static void ui_render_locked(void) {
     printf(UI_COLOR_ROOM "                         Linux TCP / pthread demo\n" UI_COLOR_RESET);
     printf("-------------------------------------------------------------------\n");
     printf(UI_COLOR_SECTION "[ MAP / STATUS ]\n" UI_COLOR_RESET);
-    printf("%s\n", latest_map);
+    print_colored_map_text(latest_map);
+    printf("\n");
     printf("-------------------------------------------------------------------\n");
     printf(UI_COLOR_SECTION "[ STATUS ] " UI_COLOR_RESET "%s\n", latest_status);
     if (latest_notice[0] != '\0') {
         printf(UI_COLOR_WARN "[ NOTICE ] %s\n" UI_COLOR_RESET, latest_notice);
     }
-    printf("Commands: w/a/s/d | /chat msg | /shout msg | /map | /help | /quit\n");
+    printf("Mode: %s | MOVE: wasd instant, c chat, / command | CHAT: /move or ESC\n",
+           mode_name(input_mode));
     printf("-------------------------------------------------------------------\n");
-    printf(UI_COLOR_SECTION "[ CHAT / SYSTEM / QUIZ LOG ]\n" UI_COLOR_RESET);
+    printf(UI_COLOR_SECTION "[ CHAT / QUIZ LOG ]\n" UI_COLOR_RESET);
     for (int i = start; i < log_count; i++) {
         const char *line = log_lines[i % UI_LOG_LINES];
         printf("%s%s%s\n", line_color(line), line, UI_COLOR_RESET);
     }
     printf("-------------------------------------------------------------------\n");
-    printf("Input > ");
+    printf("%s > %s", mode_name(input_mode), current_input);
     fflush(stdout);
+
+    if (latest_notice_ttl > 0) {
+        latest_notice_ttl--;
+        if (latest_notice_ttl == 0) {
+            latest_notice[0] = '\0';
+        }
+    }
 }
 
 static void ui_handle_line_locked(const char *line) {
-    if (strncmp(line, "[Error]", 7) == 0) {
-        snprintf(latest_notice, sizeof(latest_notice), "%s", line);
+    if (is_system_notice(line)) {
+        ui_set_notice_locked(line);
         return;
     }
 
@@ -118,7 +263,6 @@ static void ui_handle_line_locked(const char *line) {
         if (strncmp(line, "Commands:", 9) == 0) {
             collecting_map = 0;
             snprintf(latest_map, sizeof(latest_map), "%s", map_builder);
-            latest_notice[0] = '\0';
         }
         return;
     }
@@ -126,7 +270,9 @@ static void ui_handle_line_locked(const char *line) {
     if (strncmp(line, "Commands:", 9) == 0) {
         return;
     }
-    ui_add_log_locked(line);
+    if (is_log_worthy(line)) {
+        ui_add_log_locked(line);
+    }
 }
 
 // AI-assisted implementation: classifies incoming server text into map/status/log regions.
@@ -252,6 +398,247 @@ static void normalize_input(char *line) {
     }
 }
 
+static int enable_raw_terminal(void) {
+    struct termios raw;
+
+    if (!isatty(STDIN_FILENO)) {
+        return 0;
+    }
+    if (tcgetattr(STDIN_FILENO, &original_termios) != 0) {
+        return 0;
+    }
+
+    raw = original_termios;
+    raw.c_lflag &= (tcflag_t) ~(ICANON | ECHO);
+    raw.c_iflag &= (tcflag_t) ~(IXON | ICRNL);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+        return 0;
+    }
+
+    raw_terminal_enabled = 1;
+    atexit(restore_terminal);
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+    printf("\033[?25l");
+    return 1;
+}
+
+static void ui_set_mode_locked(InputMode mode, const char *notice) {
+    input_mode = mode;
+    current_input[0] = '\0';
+    if (notice != NULL) {
+        ui_set_notice_locked(notice);
+    }
+}
+
+static void ui_append_input_locked(char ch) {
+    size_t len = strlen(current_input);
+    if (len + 1 < sizeof(current_input)) {
+        current_input[len] = ch;
+        current_input[len + 1] = '\0';
+    }
+}
+
+static void ui_backspace_input_locked(void) {
+    size_t len = strlen(current_input);
+    if (len > 0) {
+        current_input[len - 1] = '\0';
+    }
+}
+
+static void submit_chat_input(int sock) {
+    char out[MAX_MSG + 16];
+
+    pthread_mutex_lock(&ui_mutex);
+    if (strcmp(current_input, "/move") == 0) {
+        ui_set_mode_locked(MODE_MOVE, "[Client] Move mode.");
+        ui_render_locked();
+        pthread_mutex_unlock(&ui_mutex);
+        return;
+    }
+    if (strcmp(current_input, "/quit") == 0 || strcmp(current_input, "/exit") == 0) {
+        pthread_mutex_unlock(&ui_mutex);
+        send_line(sock, current_input);
+        running = 0;
+        return;
+    }
+    if (current_input[0] == '/') {
+        snprintf(out, sizeof(out), "%s", current_input);
+    } else if (current_input[0] != '\0') {
+        snprintf(out, sizeof(out), "/chat %s", current_input);
+    } else {
+        out[0] = '\0';
+    }
+    current_input[0] = '\0';
+    ui_render_locked();
+    pthread_mutex_unlock(&ui_mutex);
+
+    if (out[0] != '\0') {
+        send_line(sock, out);
+    }
+}
+
+static void submit_command_input(int sock) {
+    char out[MAX_MSG];
+
+    pthread_mutex_lock(&ui_mutex);
+    snprintf(out, sizeof(out), "%s", current_input);
+
+    if (strcmp(out, "/chat") == 0 || strcmp(out, "/c") == 0) {
+        ui_set_mode_locked(MODE_CHAT, "[Client] Chat mode. Type /move or ESC to return.");
+        ui_render_locked();
+        pthread_mutex_unlock(&ui_mutex);
+        return;
+    }
+
+    ui_set_mode_locked(MODE_MOVE, NULL);
+    ui_render_locked();
+    pthread_mutex_unlock(&ui_mutex);
+
+    if (out[0] != '\0') {
+        send_line(sock, out);
+        if (strcmp(out, "/quit") == 0 || strcmp(out, "/exit") == 0) {
+            running = 0;
+        }
+    }
+}
+
+static void handle_escape_in_move_mode(int sock);
+
+// AI-assisted implementation: raw terminal input loop for instant movement and modal chat.
+static void raw_input_loop(int sock) {
+    char ch;
+
+    pthread_mutex_lock(&ui_mutex);
+    ui_set_mode_locked(MODE_MOVE, "[Client] Move mode. Press c for chat, / for commands.");
+    ui_render_locked();
+    pthread_mutex_unlock(&ui_mutex);
+
+    while (running && read(STDIN_FILENO, &ch, 1) == 1) {
+        if (input_mode == MODE_MOVE) {
+            char lower = (char)tolower((unsigned char)ch);
+            if (ch == 27) {
+                handle_escape_in_move_mode(sock);
+            } else if (lower == 'w' || lower == 'a' || lower == 's' || lower == 'd') {
+                char move[2] = {lower, '\0'};
+                send_line(sock, move);
+            } else if (lower == 'c') {
+                pthread_mutex_lock(&ui_mutex);
+                ui_set_mode_locked(MODE_CHAT, "[Client] Chat mode. Type /move or ESC to return.");
+                ui_render_locked();
+                pthread_mutex_unlock(&ui_mutex);
+            } else if (ch == '/') {
+                pthread_mutex_lock(&ui_mutex);
+                ui_set_mode_locked(MODE_COMMAND, NULL);
+                strcpy(current_input, "/");
+                ui_render_locked();
+                pthread_mutex_unlock(&ui_mutex);
+            } else if (lower == 'm') {
+                send_line(sock, "/map");
+            } else if (lower == 'h') {
+                send_line(sock, "/help");
+            } else if (lower == 'q') {
+                send_line(sock, "/quit");
+                running = 0;
+                break;
+            }
+        } else {
+            if (ch == 27) {
+                pthread_mutex_lock(&ui_mutex);
+                ui_set_mode_locked(MODE_MOVE, "[Client] Move mode.");
+                ui_render_locked();
+                pthread_mutex_unlock(&ui_mutex);
+                continue;
+            }
+            if (ch == '\r' || ch == '\n') {
+                if (input_mode == MODE_CHAT) {
+                    submit_chat_input(sock);
+                } else {
+                    submit_command_input(sock);
+                }
+                continue;
+            }
+            if (ch == 127 || ch == '\b') {
+                pthread_mutex_lock(&ui_mutex);
+                ui_backspace_input_locked();
+                ui_render_locked();
+                pthread_mutex_unlock(&ui_mutex);
+                continue;
+            }
+            if (isprint((unsigned char)ch)) {
+                pthread_mutex_lock(&ui_mutex);
+                ui_append_input_locked(ch);
+                ui_render_locked();
+                pthread_mutex_unlock(&ui_mutex);
+            }
+        }
+    }
+}
+
+static void line_input_loop(int sock) {
+    char line[MAX_MSG];
+
+    while (running && fgets(line, sizeof(line), stdin)) {
+        normalize_input(line);
+        if (line[0] == '\0') {
+            pthread_mutex_lock(&ui_mutex);
+            ui_render_locked();
+            pthread_mutex_unlock(&ui_mutex);
+            continue;
+        }
+        send_line(sock, line);
+        if (strcmp(line, "/quit") == 0 || strcmp(line, "/exit") == 0) {
+            running = 0;
+            break;
+        }
+    }
+}
+
+static int read_byte_with_timeout(char *out) {
+    fd_set set;
+    struct timeval tv;
+
+    FD_ZERO(&set);
+    FD_SET(STDIN_FILENO, &set);
+    tv.tv_sec = 0;
+    tv.tv_usec = 30000;
+
+    if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) > 0) {
+        return read(STDIN_FILENO, out, 1) == 1;
+    }
+    return 0;
+}
+
+static void handle_escape_in_move_mode(int sock) {
+    char seq1;
+    char seq2;
+    char move[2] = {'\0', '\0'};
+
+    if (!read_byte_with_timeout(&seq1) || !read_byte_with_timeout(&seq2)) {
+        return;
+    }
+    if (seq1 != '[') {
+        return;
+    }
+
+    if (seq2 == 'A') {
+        move[0] = 'w';
+    } else if (seq2 == 'B') {
+        move[0] = 's';
+    } else if (seq2 == 'C') {
+        move[0] = 'd';
+    } else if (seq2 == 'D') {
+        move[0] = 'a';
+    }
+
+    if (move[0] != '\0') {
+        send_line(sock, move);
+    }
+}
+
 // AI-assisted implementation: Linux TCP client with dashboard UI and input sender.
 int main(int argc, char *argv[]) {
     const char *host = "127.0.0.1";
@@ -302,26 +689,21 @@ int main(int argc, char *argv[]) {
     }
 
     pthread_mutex_lock(&ui_mutex);
-    ui_add_log_locked("[Client] Type /help for commands. WASD is the stable movement input.");
+    ui_add_log_locked("[Client] MOVE: wasd instant, c chat, / command. Fallback terminals use Enter.");
     ui_render_locked();
     pthread_mutex_unlock(&ui_mutex);
 
-    char line[MAX_MSG];
-    while (running && fgets(line, sizeof(line), stdin)) {
-        normalize_input(line);
-        if (line[0] == '\0') {
-            pthread_mutex_lock(&ui_mutex);
-            ui_render_locked();
-            pthread_mutex_unlock(&ui_mutex);
-            continue;
-        }
-        send_line(sock, line);
-        if (strcmp(line, "/quit") == 0 || strcmp(line, "/exit") == 0) {
-            running = 0;
-            break;
-        }
+    if (enable_raw_terminal()) {
+        raw_input_loop(sock);
+    } else {
+        pthread_mutex_lock(&ui_mutex);
+        ui_set_mode_locked(MODE_LINE, "[Client] Line input mode. Press Enter after each command.");
+        ui_render_locked();
+        pthread_mutex_unlock(&ui_mutex);
+        line_input_loop(sock);
     }
 
+    restore_terminal();
     shutdown(sock, SHUT_RDWR);
     close(sock);
     pthread_join(tid, NULL);
