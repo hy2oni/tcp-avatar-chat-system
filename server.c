@@ -83,6 +83,7 @@ static pthread_mutex_t table_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void send_to_client(int sock, const char *msg);
 static void send_map_to_client_locked(int idx);
+static void broadcast_maps_to_room_locked(int room_id);
 static void handle_tile_event_after_move(int idx);
 static void disconnect_client(int idx);
 
@@ -386,6 +387,15 @@ static void send_map_to_client_locked(int idx) {
     send_to_client(clients[idx].sock, out);
 }
 
+// AI-assisted implementation: pushes fresh room maps to all clients after shared state changes.
+static void broadcast_maps_to_room_locked(int room_id) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].active && clients[i].room_id == room_id) {
+            send_map_to_client_locked(i);
+        }
+    }
+}
+
 static void send_help(int sock) {
     const char *help =
         "\n[Help]\n"
@@ -525,6 +535,8 @@ static void handle_move(int idx, int dx, int dy) {
     int moved = 0;
     int old_table = 0;
     int sock = -1;
+    int old_room = 0;
+    int new_room = 0;
 
     pthread_mutex_lock(&clients_mutex);
     if (!clients[idx].active) {
@@ -536,6 +548,7 @@ static void handle_move(int idx, int dx, int dy) {
     int ny = clients[idx].y + dy;
     sock = clients[idx].sock;
     old_table = clients[idx].table_id;
+    old_room = clients[idx].room_id;
 
     if (!is_walkable_tile(clients[idx].room_id, nx, ny)) {
         send_to_client(sock, "[Error] You cannot move there.\n");
@@ -547,9 +560,13 @@ static void handle_move(int idx, int dx, int dy) {
         moved = 1;
         update_table_membership_after_move_locked(idx, old_table);
         handle_portal_if_any_locked(idx);
+        new_room = clients[idx].room_id;
         server_log("[MOVE] %s -> Room %d (%d,%d).", clients[idx].nickname,
                    clients[idx].room_id, clients[idx].x, clients[idx].y);
-        send_map_to_client_locked(idx);
+        broadcast_maps_to_room_locked(old_room);
+        if (new_room != old_room) {
+            broadcast_maps_to_room_locked(new_room);
+        }
     }
     pthread_mutex_unlock(&clients_mutex);
 
@@ -904,7 +921,7 @@ static int register_client(int idx) {
         snprintf(join_msg, sizeof(join_msg), "[Lobby] %s joined with avatar %c.\n", nick, avatar);
         broadcast_room_locked(1, join_msg);
         send_help(sock);
-        send_map_to_client_locked(idx);
+        broadcast_maps_to_room_locked(1);
         pthread_mutex_unlock(&clients_mutex);
 
         server_log("[LOGIN] %s/%c spawned at Lobby (%d,%d).", nick, avatar, sx, sy);
@@ -946,6 +963,9 @@ static void disconnect_client(int idx) {
                 clear_table_log(table_id);
                 server_log("[TABLE] Table %d empty. Private chat logs cleared.", table_id);
             }
+        }
+        if (room_id >= 1 && room_id <= MAX_ROOMS) {
+            broadcast_maps_to_room_locked(room_id);
         }
     }
     pthread_mutex_unlock(&clients_mutex);

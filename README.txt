@@ -53,6 +53,10 @@ The client uses ANSI escape sequences to redraw a simple dashboard:
 - recent chat/system/quiz log
 - bottom input prompt
 
+Maps are pushed by the server after movement, room transitions, joins, and
+disconnects, so users in the same room see avatar position changes without
+typing a new command.
+
 Run the client in a normal Linux terminal. If output looks messy after resizing
 the window, type /map to refresh the map area.
 
