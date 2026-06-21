@@ -48,6 +48,16 @@ static char latest_map[UI_MAP_MAX] = "Waiting for map update...";
 static char latest_status[UI_LINE_MAX] = "Not logged in";
 static char latest_notice[UI_LINE_MAX] = "";
 static int latest_notice_ttl = 0;
+static int current_room_id = 0;
+static int quiz_visible = 0;
+static int quiz_running = 0;
+static int quiz_round = 0;
+static int quiz_total = QUIZ_ROUNDS;
+static int quiz_time_left = -1;
+static char quiz_question[UI_LINE_MAX] = "No quiz running";
+static char quiz_my_answer[16] = "-";
+static char quiz_scores[UI_LINE_MAX] = "-";
+static char quiz_result[UI_LINE_MAX] = "";
 static char log_lines[UI_LOG_LINES][UI_LINE_MAX];
 static int log_count = 0;
 static int collecting_map = 0;
@@ -101,7 +111,7 @@ static const char *mode_name(InputMode mode) {
 static const char *mode_hint(InputMode mode) {
     switch (mode) {
         case MODE_MOVE:
-            return "wasd instant | c chat | / command | q quit";
+            return "wasd instant | O/X quiz | c chat | / command | q quit";
         case MODE_CHAT:
             return "Enter sends chat | /move or ESC returns";
         case MODE_COMMAND:
@@ -171,6 +181,95 @@ static void ui_extract_status_locked(const char *line) {
     }
 }
 
+static void ui_extract_room_locked(const char *line) {
+    int room_id = 0;
+
+    if (sscanf(line, "==== Room %d:", &room_id) == 1) {
+        current_room_id = room_id;
+        if (current_room_id != 2 && !quiz_running) {
+            quiz_visible = 0;
+        }
+    }
+}
+
+// AI-assisted implementation: consumes compact quiz protocol lines for the fixed status panel.
+static int ui_handle_quiz_protocol_locked(const char *line) {
+    char copy[UI_LINE_MAX * 2];
+    char *parts[5] = {0};
+    char *save = NULL;
+    char *token = NULL;
+    int count = 0;
+
+    if (strncmp(line, "QUIZ_", 5) != 0) {
+        return 0;
+    }
+
+    if (strncmp(line, "QUIZ_SCORES|", 12) == 0) {
+        quiz_visible = 1;
+        snprintf(quiz_scores, sizeof(quiz_scores), "%s", line + 12);
+        return 1;
+    }
+    if (strncmp(line, "QUIZ_RESULT|", 12) == 0) {
+        quiz_visible = 1;
+        snprintf(quiz_result, sizeof(quiz_result), "%s", line + 12);
+        ui_add_log_locked("[Quiz] Round result updated.");
+        return 1;
+    }
+    if (strncmp(line, "QUIZ_FINAL|", 11) == 0) {
+        quiz_visible = 1;
+        quiz_running = 0;
+        quiz_time_left = 0;
+        snprintf(quiz_result, sizeof(quiz_result), "%s", line + 11);
+        ui_add_log_locked("[Quiz] Final scoreboard updated.");
+        return 1;
+    }
+
+    snprintf(copy, sizeof(copy), "%s", line);
+    token = strtok_r(copy, "|", &save);
+    while (token != NULL && count < 5) {
+        parts[count++] = token;
+        token = strtok_r(NULL, "|", &save);
+    }
+
+    if (count == 0) {
+        return 1;
+    }
+    if (strcmp(parts[0], "QUIZ_RESET") == 0) {
+        quiz_visible = 1;
+        quiz_running = 1;
+        quiz_round = 0;
+        quiz_total = count > 1 ? atoi(parts[1]) : QUIZ_ROUNDS;
+        quiz_time_left = -1;
+        snprintf(quiz_question, sizeof(quiz_question), "Waiting for first question");
+        snprintf(quiz_my_answer, sizeof(quiz_my_answer), "-");
+        snprintf(quiz_scores, sizeof(quiz_scores), "-");
+        quiz_result[0] = '\0';
+        return 1;
+    }
+    if (strcmp(parts[0], "QUIZ_STATE") == 0 && count >= 5) {
+        quiz_visible = 1;
+        quiz_running = 1;
+        quiz_round = atoi(parts[1]);
+        quiz_total = atoi(parts[2]);
+        quiz_time_left = atoi(parts[3]);
+        snprintf(quiz_question, sizeof(quiz_question), "%s", parts[4]);
+        snprintf(quiz_my_answer, sizeof(quiz_my_answer), "-");
+        quiz_result[0] = '\0';
+        return 1;
+    }
+    if (strcmp(parts[0], "QUIZ_TICK") == 0 && count >= 2) {
+        quiz_visible = 1;
+        quiz_time_left = atoi(parts[1]);
+        return 1;
+    }
+    if (strcmp(parts[0], "QUIZ_ANSWER") == 0 && count >= 2) {
+        quiz_visible = 1;
+        snprintf(quiz_my_answer, sizeof(quiz_my_answer), "%s", parts[1]);
+        return 1;
+    }
+    return 1;
+}
+
 static const char *avatar_color(char ch) {
     switch (toupper((unsigned char)ch) % 5) {
         case 0:
@@ -227,6 +326,43 @@ static const char *line_color(const char *line) {
     return UI_COLOR_RESET;
 }
 
+static void print_trimmed_value(const char *label, const char *value) {
+    char clipped[UI_LINE_MAX];
+
+    snprintf(clipped, sizeof(clipped), "%s", value != NULL && value[0] != '\0' ? value : "-");
+    if (strlen(clipped) > 60) {
+        clipped[57] = '.';
+        clipped[58] = '.';
+        clipped[59] = '.';
+        clipped[60] = '\0';
+    }
+    printf("%-8s %s\n", label, clipped);
+}
+
+static void ui_render_quiz_panel_locked(void) {
+    if (!quiz_visible && current_room_id != 2) {
+        return;
+    }
+
+    printf("-------------------------------------------------------------------\n");
+    printf(UI_COLOR_SECTION "[ QUIZ STATUS ] " UI_COLOR_RESET);
+    if (quiz_running) {
+        printf(UI_COLOR_OK "RUNNING\n" UI_COLOR_RESET);
+    } else {
+        printf(UI_COLOR_DIM "READY\n" UI_COLOR_RESET);
+    }
+    printf("Round    %d / %d", quiz_round, quiz_total);
+    if (quiz_time_left >= 0) {
+        printf("        Time left: %02d sec", quiz_time_left);
+    }
+    printf("        My answer: %s\n", quiz_my_answer);
+    print_trimmed_value("Question", quiz_question);
+    print_trimmed_value("Scores", quiz_scores);
+    if (quiz_result[0] != '\0') {
+        print_trimmed_value("Result", quiz_result);
+    }
+}
+
 // AI-assisted implementation: redraws a stable terminal dashboard without ncurses.
 static void ui_render_locked(void) {
     int visible_logs = input_mode == MODE_CHAT ? UI_LOG_LINES_CHAT : UI_LOG_LINES_COMPACT;
@@ -239,6 +375,7 @@ static void ui_render_locked(void) {
     printf(UI_COLOR_SECTION "[ MAP / STATUS ]\n" UI_COLOR_RESET);
     print_colored_map_text(latest_map);
     printf("\n");
+    ui_render_quiz_panel_locked();
     printf("-------------------------------------------------------------------\n");
     printf(UI_COLOR_SECTION "[ STATUS ] " UI_COLOR_RESET "%s\n", latest_status);
     if (latest_notice[0] != '\0') {
@@ -265,6 +402,10 @@ static void ui_render_locked(void) {
 }
 
 static void ui_handle_line_locked(const char *line) {
+    if (ui_handle_quiz_protocol_locked(line)) {
+        return;
+    }
+
     if (is_system_notice(line)) {
         ui_set_notice_locked(line);
         return;
@@ -273,6 +414,7 @@ static void ui_handle_line_locked(const char *line) {
     if (strncmp(line, "==== Room", 9) == 0) {
         collecting_map = 1;
         map_builder[0] = '\0';
+        ui_extract_room_locked(line);
     }
 
     if (collecting_map) {
@@ -560,7 +702,7 @@ static void raw_input_loop(int sock) {
     char ch;
 
     pthread_mutex_lock(&ui_mutex);
-    ui_set_mode_locked(MODE_MOVE, "[Client] Move mode. Press c for chat, / for commands.");
+    ui_set_mode_locked(MODE_MOVE, "[Client] Move mode. WASD moves, O/X answers quizzes.");
     ui_render_locked();
     pthread_mutex_unlock(&ui_mutex);
 
@@ -572,6 +714,9 @@ static void raw_input_loop(int sock) {
             } else if (lower == 'w' || lower == 'a' || lower == 's' || lower == 'd') {
                 char move[2] = {lower, '\0'};
                 send_line(sock, move);
+            } else if (lower == 'o' || lower == 'x') {
+                char answer[2] = {(char)toupper((unsigned char)lower), '\0'};
+                send_line(sock, answer);
             } else if (lower == 'c') {
                 pthread_mutex_lock(&ui_mutex);
                 ui_set_mode_locked(MODE_CHAT, "[Client] Chat mode. Type /move or ESC to return.");
@@ -736,7 +881,7 @@ int main(int argc, char *argv[]) {
     }
 
     pthread_mutex_lock(&ui_mutex);
-    ui_add_log_locked("[Client] MOVE: wasd instant, c chat, / command. Fallback terminals use Enter.");
+    ui_add_log_locked("[Client] MOVE: wasd instant, O/X quiz answer, c chat, / command.");
     pthread_mutex_unlock(&ui_mutex);
 
     if (enable_raw_terminal()) {

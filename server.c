@@ -418,6 +418,34 @@ static void broadcast_quiz_viewers_locked(const char *msg) {
     }
 }
 
+// AI-assisted implementation: builds compact quiz score text for the client status panel.
+static void build_quiz_score_summary_locked(char *out, size_t outsz) {
+    size_t used = 0;
+    int count = 0;
+
+    if (outsz == 0) {
+        return;
+    }
+    out[0] = '\0';
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].active || !clients[i].quiz_participant) {
+            continue;
+        }
+        used += snprintf(out + used, outsz - used, "%s%s:%d",
+                         count > 0 ? " | " : "", clients[i].nickname, clients[i].quiz_score);
+        if (used >= outsz) {
+            out[outsz - 1] = '\0';
+            return;
+        }
+        count++;
+    }
+
+    if (count == 0) {
+        snprintf(out, outsz, "No participants");
+    }
+}
+
 // AI-assisted implementation: renders authoritative server map with dynamic client avatars.
 static void render_map_for_client_locked(int idx, char *out, size_t outsz) {
     char map[MAP_H][MAP_W + 1];
@@ -441,7 +469,7 @@ static void render_map_for_client_locked(int idx, char *out, size_t outsz) {
     for (int y = 0; y < MAP_H && used < outsz; y++) {
         used += snprintf(out + used, outsz - used, "%s\n", map[y]);
     }
-    snprintf(out + used, outsz - used, "Commands: w/a/s/d, /chat, /map, /help, /quit\n\n");
+    snprintf(out + used, outsz - used, "Commands: w/a/s/d, O/X, /chat, /map, /help, /quit\n\n");
 }
 
 static void send_map_to_client_locked(int idx) {
@@ -463,11 +491,11 @@ static void send_help(int sock) {
     const char *help =
         "\n[Help]\n"
         "w/a/s/d or arrow keys: move\n"
+        "O or X: answer quiz question while participating\n"
         "/chat <message>, /c <message>: room chat or table chat\n"
         "/shout <message>, /s <message>: public Room 3 chat\n"
         "/map: print current map\n"
         "/start: start O/X quiz when allowed in Room 2\n"
-        "O or X: answer quiz question while participating\n"
         "/quit or /exit: disconnect\n\n";
     send_to_client(sock, help);
 }
@@ -700,6 +728,8 @@ static void *quiz_thread(void *arg) {
     for (int round = 0; round < QUIZ_ROUNDS; round++) {
         int qidx;
         char msg[4096];
+        char scores[512];
+        char quiz_signal[1024];
 
         pthread_mutex_lock(&quiz_mutex);
         quiz_state.current_round = round;
@@ -713,6 +743,10 @@ static void *quiz_thread(void *arg) {
                 clients[i].has_answered = 0;
             }
         }
+        build_quiz_score_summary_locked(scores, sizeof(scores));
+        snprintf(quiz_signal, sizeof(quiz_signal), "QUIZ_STATE|%d|%d|10|%s\nQUIZ_SCORES|%s\n",
+                 round + 1, QUIZ_ROUNDS, questions[qidx].question, scores);
+        broadcast_quiz_viewers_locked(quiz_signal);
         snprintf(msg, sizeof(msg),
                  "\n[Quiz] Round %d/%d - 10 seconds\n[Quiz] %s (Answer with O or X)\n",
                  round + 1, QUIZ_ROUNDS, questions[qidx].question);
@@ -720,12 +754,24 @@ static void *quiz_thread(void *arg) {
         pthread_mutex_unlock(&clients_mutex);
 
         server_log("[QUIZ] Round %d started.", round + 1);
-        sleep(10);
+        for (int left = 9; left >= 0; left--) {
+            sleep(1);
+            pthread_mutex_lock(&clients_mutex);
+            snprintf(quiz_signal, sizeof(quiz_signal), "QUIZ_TICK|%d\n", left);
+            broadcast_quiz_viewers_locked(quiz_signal);
+            pthread_mutex_unlock(&clients_mutex);
+        }
 
         pthread_mutex_lock(&clients_mutex);
         size_t used = 0;
+        size_t result_used = 0;
+        char result_summary[1024];
+
+        result_summary[0] = '\0';
         used += snprintf(msg + used, sizeof(msg) - used,
                          "\n[Quiz] Time up. Correct answer: %c\n", questions[qidx].answer);
+        result_used += snprintf(result_summary + result_used, sizeof(result_summary) - result_used,
+                                "Q%d answer=%c", round + 1, questions[qidx].answer);
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (!clients[i].active || !clients[i].quiz_participant) {
                 continue;
@@ -742,19 +788,30 @@ static void *quiz_thread(void *arg) {
             used += snprintf(msg + used, sizeof(msg) - used,
                              "[Quiz] %-16s answer=%c result=%s score=%d\n",
                              clients[i].nickname, clients[i].quiz_answer, status, clients[i].quiz_score);
+            result_used += snprintf(result_summary + result_used, sizeof(result_summary) - result_used,
+                                    " | %s:%c %s", clients[i].nickname, clients[i].quiz_answer, status);
         }
         used += snprintf(msg + used, sizeof(msg) - used, "\n");
         broadcast_quiz_viewers_locked(msg);
+        build_quiz_score_summary_locked(scores, sizeof(scores));
+        snprintf(quiz_signal, sizeof(quiz_signal), "QUIZ_RESULT|%s\nQUIZ_SCORES|%s\n",
+                 result_summary, scores);
+        broadcast_quiz_viewers_locked(quiz_signal);
         pthread_mutex_unlock(&clients_mutex);
     }
 
     pthread_mutex_lock(&clients_mutex);
     char final[4096];
+    char final_summary[1024];
+    char quiz_signal[1536];
+    char scores[512];
     size_t used = 0;
+    size_t summary_used = 0;
     int top_score = -1;
     int low_score = 9999;
     int participant_count = 0;
 
+    final_summary[0] = '\0';
     used += snprintf(final + used, sizeof(final) - used, "\n[Quiz] Final scoreboard\n");
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].active || !clients[i].quiz_participant) {
@@ -774,25 +831,55 @@ static void *quiz_thread(void *arg) {
 
     if (participant_count == 0) {
         used += snprintf(final + used, sizeof(final) - used, "[Quiz] No active participants.\n");
+        snprintf(final_summary, sizeof(final_summary), "No active participants");
+    } else if (participant_count == 1) {
+        used += snprintf(final + used, sizeof(final) - used, "[Quiz] Winner: ");
+        summary_used += snprintf(final_summary + summary_used, sizeof(final_summary) - summary_used, "Winner: ");
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].active && clients[i].quiz_participant) {
+                used += snprintf(final + used, sizeof(final) - used, "%s", clients[i].nickname);
+                summary_used += snprintf(final_summary + summary_used, sizeof(final_summary) - summary_used,
+                                         "%s", clients[i].nickname);
+            }
+        }
+        used += snprintf(final + used, sizeof(final) - used, "\n\n");
+    } else if (top_score == low_score) {
+        used += snprintf(final + used, sizeof(final) - used, "[Quiz] Draw: ");
+        summary_used += snprintf(final_summary + summary_used, sizeof(final_summary) - summary_used, "Draw: ");
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].active && clients[i].quiz_participant) {
+                used += snprintf(final + used, sizeof(final) - used, "%s ", clients[i].nickname);
+                summary_used += snprintf(final_summary + summary_used, sizeof(final_summary) - summary_used,
+                                         "%s ", clients[i].nickname);
+            }
+        }
+        used += snprintf(final + used, sizeof(final) - used, "\n\n");
     } else {
         used += snprintf(final + used, sizeof(final) - used, "[Quiz] Winner(s): ");
+        summary_used += snprintf(final_summary + summary_used, sizeof(final_summary) - summary_used, "Winner(s): ");
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].active && clients[i].quiz_participant && clients[i].quiz_score == top_score) {
                 used += snprintf(final + used, sizeof(final) - used, "%s ", clients[i].nickname);
+                summary_used += snprintf(final_summary + summary_used, sizeof(final_summary) - summary_used,
+                                         "%s ", clients[i].nickname);
             }
         }
         used += snprintf(final + used, sizeof(final) - used, "\n[Quiz] Loser(s): ");
+        summary_used += snprintf(final_summary + summary_used, sizeof(final_summary) - summary_used, "| Loser(s): ");
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].active && clients[i].quiz_participant && clients[i].quiz_score == low_score) {
                 used += snprintf(final + used, sizeof(final) - used, "%s ", clients[i].nickname);
+                summary_used += snprintf(final_summary + summary_used, sizeof(final_summary) - summary_used,
+                                         "%s ", clients[i].nickname);
             }
-        }
-        if (top_score == low_score) {
-            used += snprintf(final + used, sizeof(final) - used, "\n[Quiz] Draw: all players have the same score.");
         }
         used += snprintf(final + used, sizeof(final) - used, "\n\n");
     }
     broadcast_quiz_viewers_locked(final);
+    build_quiz_score_summary_locked(scores, sizeof(scores));
+    snprintf(quiz_signal, sizeof(quiz_signal), "QUIZ_FINAL|%s\nQUIZ_SCORES|%s\n",
+             final_summary, scores);
+    broadcast_quiz_viewers_locked(quiz_signal);
     pthread_mutex_unlock(&clients_mutex);
 
     pthread_mutex_lock(&quiz_mutex);
@@ -812,8 +899,11 @@ static void handle_quiz_answer(int idx, char answer) {
     if (quiz_state.running) {
         pthread_mutex_lock(&clients_mutex);
         if (clients[idx].active && clients[idx].quiz_participant) {
+            char ack[64];
             clients[idx].quiz_answer = answer;
             clients[idx].has_answered = 1;
+            snprintf(ack, sizeof(ack), "QUIZ_ANSWER|%c\n", answer);
+            send_to_client(clients[idx].sock, ack);
             send_to_client(clients[idx].sock, "[Quiz] Answer saved. Last answer before time ends counts.\n");
             server_log("[QUIZ] %s answered %c.", clients[idx].nickname, answer);
             accepted = 1;
@@ -854,6 +944,7 @@ static void handle_quiz_start(int idx) {
                 clients[i].quiz_participant = 0;
             }
         }
+        broadcast_quiz_viewers_locked("QUIZ_RESET|5\n");
         broadcast_quiz_viewers_locked("[Quiz] New quiz started. Participants are users currently in Room 2.\n");
         server_log("[QUIZ] %s started a quiz.", clients[idx].nickname);
     } else if (clients[idx].active) {

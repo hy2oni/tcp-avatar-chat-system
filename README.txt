@@ -53,12 +53,14 @@ Client UI
 ---------
 The client uses ANSI escape sequences to redraw a simple dashboard:
 - map/status area
+- fixed quiz status panel in Room 2
 - current player status
 - recent chat/system/quiz log
 - bottom input prompt
 
 In a normal Linux terminal, the client uses raw input mode:
 - MOVE mode: w/a/s/d moves immediately without Enter.
+- During a Room 2 quiz, O/X submits an answer immediately without Enter.
 - Press c to enter CHAT mode.
 - CHAT mode sends each line as chat after Enter.
 - Type /move or press ESC to return to MOVE mode.
