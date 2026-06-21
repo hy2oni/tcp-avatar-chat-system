@@ -186,9 +186,6 @@ static void ui_extract_room_locked(const char *line) {
 
     if (sscanf(line, "==== Room %d:", &room_id) == 1) {
         current_room_id = room_id;
-        if (current_room_id != 2 && !quiz_running) {
-            quiz_visible = 0;
-        }
     }
 }
 
@@ -241,7 +238,7 @@ static int ui_handle_quiz_protocol_locked(const char *line) {
         quiz_total = count > 1 ? atoi(parts[1]) : QUIZ_ROUNDS;
         quiz_time_left = -1;
         snprintf(quiz_question, sizeof(quiz_question), "Waiting for first question");
-        snprintf(quiz_my_answer, sizeof(quiz_my_answer), "-");
+        snprintf(quiz_my_answer, sizeof(quiz_my_answer), "Not answered");
         snprintf(quiz_scores, sizeof(quiz_scores), "-");
         quiz_result[0] = '\0';
         return 1;
@@ -253,7 +250,7 @@ static int ui_handle_quiz_protocol_locked(const char *line) {
         quiz_total = atoi(parts[2]);
         quiz_time_left = atoi(parts[3]);
         snprintf(quiz_question, sizeof(quiz_question), "%s", parts[4]);
-        snprintf(quiz_my_answer, sizeof(quiz_my_answer), "-");
+        snprintf(quiz_my_answer, sizeof(quiz_my_answer), "Not answered");
         quiz_result[0] = '\0';
         return 1;
     }
@@ -340,7 +337,7 @@ static void print_trimmed_value(const char *label, const char *value) {
 }
 
 static void ui_render_quiz_panel_locked(void) {
-    if (!quiz_visible && current_room_id != 2) {
+    if (current_room_id != 2 || !quiz_visible) {
         return;
     }
 
