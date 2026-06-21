@@ -11,7 +11,24 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define UI_LOG_LINES 14
+#define UI_LINE_MAX 256
+#define UI_MAP_MAX 4096
+#define UI_COLOR_RESET "\033[0m"
+#define UI_COLOR_TITLE "\033[1;36m"
+#define UI_COLOR_ROOM "\033[1;33m"
+#define UI_COLOR_SECTION "\033[1;34m"
+#define UI_COLOR_WARN "\033[1;31m"
+#define UI_COLOR_OK "\033[1;32m"
+
 static volatile int running = 1;
+static pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char latest_map[UI_MAP_MAX] = "Waiting for map update...";
+static char latest_status[UI_LINE_MAX] = "Not logged in";
+static char log_lines[UI_LOG_LINES][UI_LINE_MAX];
+static int log_count = 0;
+static int collecting_map = 0;
+static char map_builder[UI_MAP_MAX];
 
 static void trim_newline(char *s) {
     size_t n = strlen(s);
@@ -27,7 +44,101 @@ static void send_line(int sock, const char *line) {
     send(sock, buf, strlen(buf), 0);
 }
 
-// AI-assisted implementation: continuously prints asynchronous server messages.
+static void ui_add_log_locked(const char *line) {
+    if (line == NULL || line[0] == '\0' || strcmp(line, "LOGIN_OK") == 0) {
+        return;
+    }
+    snprintf(log_lines[log_count % UI_LOG_LINES], UI_LINE_MAX, "%s", line);
+    log_count++;
+}
+
+static void ui_extract_status_locked(const char *line) {
+    if (strncmp(line, "You: ", 5) == 0) {
+        snprintf(latest_status, sizeof(latest_status), "%s", line);
+    }
+}
+
+static const char *line_color(const char *line) {
+    if (strstr(line, "[Error]") || strstr(line, "Wrong")) {
+        return UI_COLOR_WARN;
+    }
+    if (strstr(line, "Correct") || strstr(line, "LOGIN_OK")) {
+        return UI_COLOR_OK;
+    }
+    if (strstr(line, "[Quiz]") || strstr(line, "[Table")) {
+        return UI_COLOR_ROOM;
+    }
+    return UI_COLOR_RESET;
+}
+
+// AI-assisted implementation: redraws a stable terminal dashboard without ncurses.
+static void ui_render_locked(void) {
+    int start = log_count > UI_LOG_LINES ? log_count - UI_LOG_LINES : 0;
+
+    printf("\033[2J\033[H");
+    printf(UI_COLOR_TITLE "================ TCP Multi-room Avatar Chat System ================\n" UI_COLOR_RESET);
+    printf(UI_COLOR_ROOM "                         Linux TCP / pthread demo\n" UI_COLOR_RESET);
+    printf("-------------------------------------------------------------------\n");
+    printf(UI_COLOR_SECTION "[ MAP / STATUS ]\n" UI_COLOR_RESET);
+    printf("%s\n", latest_map);
+    printf("-------------------------------------------------------------------\n");
+    printf(UI_COLOR_SECTION "[ STATUS ] " UI_COLOR_RESET "%s\n", latest_status);
+    printf("Commands: w/a/s/d | /chat msg | /shout msg | /map | /help | /quit\n");
+    printf("-------------------------------------------------------------------\n");
+    printf(UI_COLOR_SECTION "[ CHAT / SYSTEM / QUIZ LOG ]\n" UI_COLOR_RESET);
+    for (int i = start; i < log_count; i++) {
+        const char *line = log_lines[i % UI_LOG_LINES];
+        printf("%s%s%s\n", line_color(line), line, UI_COLOR_RESET);
+    }
+    printf("-------------------------------------------------------------------\n");
+    printf("Input > ");
+    fflush(stdout);
+}
+
+static void ui_handle_line_locked(const char *line) {
+    if (strncmp(line, "==== Room", 9) == 0) {
+        collecting_map = 1;
+        map_builder[0] = '\0';
+    }
+
+    if (collecting_map) {
+        strncat(map_builder, line, sizeof(map_builder) - strlen(map_builder) - 2);
+        strncat(map_builder, "\n", sizeof(map_builder) - strlen(map_builder) - 1);
+        ui_extract_status_locked(line);
+
+        if (strncmp(line, "Commands:", 9) == 0) {
+            collecting_map = 0;
+            snprintf(latest_map, sizeof(latest_map), "%s", map_builder);
+        }
+        return;
+    }
+
+    if (strncmp(line, "Commands:", 9) == 0) {
+        return;
+    }
+    ui_add_log_locked(line);
+}
+
+// AI-assisted implementation: classifies incoming server text into map/status/log regions.
+static void ui_process_server_text(const char *text) {
+    char copy[4096];
+    char *save = NULL;
+    char *line = NULL;
+
+    snprintf(copy, sizeof(copy), "%s", text);
+
+    pthread_mutex_lock(&ui_mutex);
+    line = strtok_r(copy, "\n", &save);
+    while (line != NULL) {
+        trim_newline(line);
+        ui_handle_line_locked(line);
+        line = strtok_r(NULL, "\n", &save);
+    }
+    ui_render_locked();
+    pthread_mutex_unlock(&ui_mutex);
+}
+
+// AI-assisted implementation: continuously receives asynchronous messages and refreshes UI.
 static void *recv_thread(void *arg) {
     int sock = *(int *)arg;
     char buf[2048];
@@ -35,21 +146,22 @@ static void *recv_thread(void *arg) {
     while (running) {
         ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
         if (n == 0) {
-            printf("\n[Client] Server closed the connection.\n");
+            pthread_mutex_lock(&ui_mutex);
+            ui_add_log_locked("[Client] Server closed the connection.");
             running = 0;
+            ui_render_locked();
+            pthread_mutex_unlock(&ui_mutex);
             break;
         }
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            perror("recv");
             running = 0;
             break;
         }
         buf[n] = '\0';
-        printf("%s", buf);
-        fflush(stdout);
+        ui_process_server_text(buf);
     }
     return NULL;
 }
@@ -130,7 +242,7 @@ static void normalize_input(char *line) {
     }
 }
 
-// AI-assisted implementation: Linux TCP client with input sender and receive thread.
+// AI-assisted implementation: Linux TCP client with dashboard UI and input sender.
 int main(int argc, char *argv[]) {
     const char *host = "127.0.0.1";
     int port = DEFAULT_PORT;
@@ -179,13 +291,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("[Client] Type /help for commands. WASD is the stable movement input.\n");
-    printf("[Client] Arrow keys may work after pressing Enter, depending on terminal mode.\n");
+    pthread_mutex_lock(&ui_mutex);
+    ui_add_log_locked("[Client] Type /help for commands. WASD is the stable movement input.");
+    ui_render_locked();
+    pthread_mutex_unlock(&ui_mutex);
 
     char line[MAX_MSG];
     while (running && fgets(line, sizeof(line), stdin)) {
         normalize_input(line);
         if (line[0] == '\0') {
+            pthread_mutex_lock(&ui_mutex);
+            ui_render_locked();
+            pthread_mutex_unlock(&ui_mutex);
             continue;
         }
         send_line(sock, line);
@@ -198,5 +315,6 @@ int main(int argc, char *argv[]) {
     shutdown(sock, SHUT_RDWR);
     close(sock);
     pthread_join(tid, NULL);
+    printf("\n");
     return 0;
 }

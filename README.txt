@@ -45,6 +45,17 @@ w / a / s / d          Move
 O or X                 Answer current quiz question
 /quit or /exit         Disconnect
 
+Client UI
+---------
+The client uses ANSI escape sequences to redraw a simple dashboard:
+- map/status area
+- current player status
+- recent chat/system/quiz log
+- bottom input prompt
+
+Run the client in a normal Linux terminal. If output looks messy after resizing
+the window, type /map to refresh the map area.
+
 Arrow Keys
 ----------
 WASD movement is the stable supported input.
