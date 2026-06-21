@@ -15,6 +15,8 @@
 #include <unistd.h>
 
 #define UI_LOG_LINES 14
+#define UI_LOG_LINES_COMPACT 3
+#define UI_LOG_LINES_CHAT 12
 #define UI_LINE_MAX 256
 #define UI_MAP_MAX 4096
 #define UI_COLOR_RESET "\033[0m"
@@ -93,6 +95,19 @@ static const char *mode_name(InputMode mode) {
             return "COMMAND";
         default:
             return "LINE";
+    }
+}
+
+static const char *mode_hint(InputMode mode) {
+    switch (mode) {
+        case MODE_MOVE:
+            return "wasd instant | c chat | / command | q quit";
+        case MODE_CHAT:
+            return "Enter sends chat | /move or ESC returns";
+        case MODE_COMMAND:
+            return "Enter runs command | ESC cancels";
+        default:
+            return "Enter sends command";
     }
 }
 
@@ -210,7 +225,8 @@ static const char *line_color(const char *line) {
 
 // AI-assisted implementation: redraws a stable terminal dashboard without ncurses.
 static void ui_render_locked(void) {
-    int start = log_count > UI_LOG_LINES ? log_count - UI_LOG_LINES : 0;
+    int visible_logs = input_mode == MODE_CHAT ? UI_LOG_LINES_CHAT : UI_LOG_LINES_COMPACT;
+    int start = log_count > visible_logs ? log_count - visible_logs : 0;
 
     printf("\033[2J\033[H");
     printf(UI_COLOR_TITLE "================ TCP Multi-room Avatar Chat System ================\n" UI_COLOR_RESET);
@@ -224,10 +240,10 @@ static void ui_render_locked(void) {
     if (latest_notice[0] != '\0') {
         printf(UI_COLOR_WARN "[ NOTICE ] %s\n" UI_COLOR_RESET, latest_notice);
     }
-    printf("Mode: %s | MOVE: wasd instant, c chat, / command | CHAT: /move or ESC\n",
-           mode_name(input_mode));
+    printf("Mode: %s | %s\n", mode_name(input_mode), mode_hint(input_mode));
     printf("-------------------------------------------------------------------\n");
-    printf(UI_COLOR_SECTION "[ CHAT / QUIZ LOG ]\n" UI_COLOR_RESET);
+    printf(UI_COLOR_SECTION "%s\n" UI_COLOR_RESET,
+           input_mode == MODE_CHAT ? "[ CHAT VIEW ]" : "[ RECENT LOG ]");
     for (int i = start; i < log_count; i++) {
         const char *line = log_lines[i % UI_LOG_LINES];
         printf("%s%s%s\n", line_color(line), line, UI_COLOR_RESET);
