@@ -1,0 +1,6 @@
+server
+client
+*.o
+core
+core.*
+.DS_Store
